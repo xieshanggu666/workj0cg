@@ -10,6 +10,7 @@ import InterviewView from '@/components/InterviewView.vue'
 import OfferView from '@/components/OfferView.vue'
 import ApprovalView from '@/components/ApprovalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
+import CrisisView from '@/components/CrisisView.vue'
 
 const store = useHrStore()
 const view = ref('overview')
@@ -24,13 +25,18 @@ const navs = [
   { k: 'interview', icon: '💬', label: '面试管理' },
   { k: 'offer', icon: '📄', label: 'Offer 管理' },
   { k: 'approval', icon: '✅', label: '审批中心' },
+  { k: 'crisis', icon: '🛡️', label: '危机审计' },
   { k: 'reports', icon: '📈', label: '报表中心' }
 ]
 
 const roleIcon = { recruiter: '🧭', interviewer: '💬', hiring_manager: '🏢' }
 const notifyIcon = {
   task_submitted: '📨', task_approved: '✅', task_returned: '↩️', task_resubmitted: '🔁',
-  task_executed: '🎉', task_failed: '⚠️', task_cancelled: '🚫'
+  task_executed: '🎉', task_failed: '⚠️', task_cancelled: '🚫',
+  crisis_declared: '🚨', crisis_state: '⚡', crisis_commander: '🔀',
+  crisis_grant: '🔑', crisis_grant_log: '🔑', crisis_grant_revoked: '🔒',
+  crisis_rollback: '⏪', crisis_ticket: '🎫', crisis_ticket_assign: '🎫', crisis_ticket_update: '🎫',
+  crisis_report: '📝', crisis_closed: '🧾'
 }
 
 function onSwitchUser(e) {
@@ -44,10 +50,10 @@ function toggleNotify() {
 function readAll() {
   store.markNotificationsRead()
 }
-// 点击通知跳转到审批中心并关闭面板
-function openNotify() {
+// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，其余 → 审批中心
+function openNotify(n) {
   showNotify.value = false
-  view.value = 'approval'
+  view.value = String(n?.type || '').startsWith('crisis_') ? 'crisis' : 'approval'
 }
 
 onMounted(store.refresh)
@@ -61,10 +67,13 @@ onMounted(store.refresh)
         <div><b>TalentFlow</b><em class="muted">招聘智能匹配平台</em></div>
       </div>
       <nav>
-        <button v-for="n in navs" :key="n.k" class="navitem" :class="{ on: view === n.k }" @click="view = n.k">
-          <span>{{ n.icon }}</span>{{ n.label }}
-          <em v-if="n.k === 'approval' && store.todoCount" class="nav-badge">{{ store.todoCount }}</em>
-        </button>
+          <button v-for="n in navs" :key="n.k" class="navitem" :class="{ on: view === n.k }" @click="view = n.k">
+            <span>{{ n.icon }}</span>{{ n.label }}
+            <em v-if="n.k === 'approval' && store.todoCount" class="nav-badge">{{ store.todoCount }}</em>
+            <em v-else-if="n.k === 'crisis' && store.crisisIncidents.filter(i => i.status !== 'closed').length" class="nav-badge crisis-badge">
+              {{ store.crisisIncidents.filter(i => i.status !== 'closed').length }}
+            </em>
+          </button>
       </nav>
       <div class="mini card">
         <div class="mini-row"><span class="muted">在招职位</span><b>{{ store.openPositions.length }}</b></div>
@@ -100,12 +109,12 @@ onMounted(store.refresh)
                 <button class="ghost sm" :disabled="!store.unreadCount" @click="readAll">全部已读</button>
               </div>
               <div class="np-list">
-                <div class="np-item" v-for="n in store.myNotifications.slice(0, 30)" :key="n.id" :class="{ unread: !n.is_read }" @click="openNotify">
+                <div class="np-item" v-for="n in store.myNotifications.slice(0, 30)" :key="n.id" :class="{ unread: !n.is_read }" @click="openNotify(n)">
                   <span class="np-icon">{{ notifyIcon[n.type] || '📌' }}</span>
                   <div class="np-body">
                     <b>{{ n.title }}</b>
                     <p>{{ n.body }}</p>
-                    <em class="muted">{{ n.created_at }}</em>
+                    <em class="muted">{{ n.created_at }}<template v-if="n.owner_name"> · 责任人 {{ n.owner_name }}</template></em>
                   </div>
                 </div>
                 <div class="empty" v-if="!store.myNotifications.length">暂无通知。</div>
@@ -123,6 +132,7 @@ onMounted(store.refresh)
         <InterviewView v-else-if="view === 'interview'" />
         <OfferView v-else-if="view === 'offer'" />
         <ApprovalView v-else-if="view === 'approval'" />
+        <CrisisView v-else-if="view === 'crisis'" />
         <ReportsView v-else />
       </section>
     </main>
@@ -156,6 +166,7 @@ main { flex: 1; min-width: 0; }
 .pill { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
 .pill b { color: var(--text); }
 .nav-badge { margin-left: auto; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
+.nav-badge.crisis-badge { background: var(--purple); }
 .idzone { display: flex; align-items: center; gap: 10px; }
 .idchip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 6px 4px 12px; font-size: 13px; }
 .idchip select { border: none; background: transparent; padding: 3px 4px; font-size: 13px; }

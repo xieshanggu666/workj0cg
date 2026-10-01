@@ -42,6 +42,13 @@ export const useHrStore = defineStore('hr', {
     users: s => s.data?.users || [],
     approvals: s => s.data?.approvals || [],
     notifications: s => s.data?.notifications || [],
+    // 跨角色危机处置审计
+    crisisIncidents: s => s.data?.crisisIncidents || [],
+    crisisEntries: s => s.data?.crisisEntries || [],
+    crisisGrants: s => s.data?.crisisGrants || [],
+    crisisTickets: s => s.data?.crisisTickets || [],
+    crisisReports: s => s.data?.crisisReports || [],
+    crisisVerification: s => s.data?.crisisVerification || {},
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -190,6 +197,87 @@ export const useHrStore = defineStore('hr', {
     },
     markNotificationsRead(ids) {
       return this.api('POST', '/notifications/read', ids?.length ? { ids } : {})
-    }
+    },
+    // ---------------- 跨角色危机处置审计 ----------------
+    activeIncidentOf(appId) {
+      return (this.data?.crisisIncidents || [])
+        .find(i => i.application_id === appId && i.status !== 'closed') || null
+    },
+    // 当前身份是否事件处置成员（指挥官/立案人/有效临时授权）
+    isIncidentMember(inc) {
+      if (!inc) return false
+      const me = this.currentUser
+      if (!me) return false
+      if (inc.commander_id === me.id || inc.declared_by === me.id) return true
+      return (this.data?.crisisGrants || []).some(g =>
+        g.incident_id === inc.id && g.grantee_id === me.id && g.status === 'active')
+    },
+    crisisEntriesOf(incidentId) {
+      return this.crisisEntries.filter(e => e.incident_id === incidentId)
+    },
+    crisisGrantsOf(incidentId) {
+      return this.crisisGrants.filter(g => g.incident_id === incidentId)
+    },
+    crisisTicketsOf(incidentId) {
+      return this.crisisTickets.filter(t => t.incident_id === incidentId)
+    },
+    crisisReportOf(incidentId) {
+      return this.crisisReports.find(r => r.incident_id === incidentId) || null
+    },
+    declareCrisis(payload) {
+      return this.runBusy('crisis:declare', () =>
+        this.api('POST', '/crisis/incidents', payload, { success: '危机事件已立案，审计链已生成' }))
+    },
+    crisisState(id, status, note) {
+      return this.runBusy(`crisis-state:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/state`, { status, note }, { success: '事件状态已更新' }))
+    },
+    changeCommander(id, commanderId, note) {
+      return this.runBusy(`crisis-cmdr:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/commander`, { commander_id: commanderId, note }, { success: '指挥官已变更，责任已移交' }))
+    },
+    grantRole(id, payload) {
+      return this.runBusy(`crisis-grant:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/grants`, payload, { success: '临时授权已授予并上链' }))
+    },
+    revokeGrant(grantId, note) {
+      return this.runBusy(`crisis-revoke:${grantId}`, () =>
+        this.api('POST', `/crisis/grants/${grantId}/revoke`, { note }, { success: '临时授权已收回' }))
+    },
+    crisisRollback(id, payload) {
+      return this.runBusy(`crisis-rb:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/rollback`, payload, { success: '危机回退已执行并写入审计链' }))
+    },
+    crisisAction(id, payload) {
+      return this.runBusy(`crisis-act:${id}:${Date.now()}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/actions`, payload, { success: '关键操作已上链' }))
+    },
+    createTicket(id, payload) {
+      return this.runBusy(`crisis-tk-new:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/tickets`, payload, { success: '工单已创建并通知责任人' }))
+    },
+    updateTicket(ticketId, payload) {
+      return this.runBusy(`crisis-tk:${ticketId}`, () =>
+        this.api('POST', `/crisis/tickets/${ticketId}`, payload, { success: '工单已更新' }))
+    },
+    saveReport(id, payload) {
+      return this.api('PUT', `/crisis/incidents/${id}/report`, payload, { success: '复盘草稿已保存' })
+    },
+    finalizeReport(id) {
+      return this.runBusy(`crisis-rpt:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/report/finalize`, {}, { success: '复盘已定稿，责任矩阵已固化' }))
+    },
+    closeIncident(id, note) {
+      return this.runBusy(`crisis-close:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/close`, { note }, { success: '事件已结案归档' }))
+    },
+    async verifyIncident(id) {
+      try {
+        const r = await j('GET', `/crisis/incidents/${id}/verify`)
+        this.notify(r.ok ? 'success' : 'error', r.ok ? `审计链校验通过（${r.count} 条）` : `审计链异常：${r.broken?.[0]?.reason || '校验失败'}`)
+        return r
+      } catch (e) { this.notify('error', e.message); return null }
+    },
+    exportIncidentUrl(id) { return `/api/crisis/incidents/${id}/export` }
   }
 })

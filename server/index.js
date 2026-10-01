@@ -1,5 +1,8 @@
 import express from 'express'
 import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
+import {
+  router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
+} from './crisis.js'
 
 const app = express()
 app.use(express.json())
@@ -44,6 +47,24 @@ class ApiError extends Error {
 const badRequest = (msg, code = 'invalid') => { throw new ApiError(400, code, msg) }
 const conflict = (msg, code = 'conflict') => { throw new ApiError(409, code, msg) }
 const forbidden = (msg, code = 'forbidden') => { throw new ApiError(403, code, msg) }
+
+// 危机处置模块回退执行器：在危机模块自己的事务内调用，豁免乐观锁版本（紧急处置可能面对过期页面），
+// 但仍走与 /rollback 完全相同的状态机（撤回联动 Offer、rollback 阶段事件、淘汰复活）
+function rollbackForIncident(applicationId, operatorName, reason) {
+  const a = db.prepare('SELECT * FROM applications WHERE id=?').get(num(applicationId))
+  if (!a) badRequest('关联应聘记录不存在', 'app_missing')
+  const from = a.stage
+  const offerBefore = offerOfApp(a.id)
+  rollbackStage(a, { operator: operatorName, reason })
+  if (a.stage === 'rejected') db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
+  const offerAfter = offerOfApp(a.id)
+  return {
+    from, to: a.stage,
+    fromLabel: STAGE_LABEL[from] || from, toLabel: STAGE_LABEL[a.stage] || a.stage,
+    version: a.version,
+    offerWithdrawn: !!offerBefore && offerBefore.status !== 'withdrawn' && offerAfter?.status === 'withdrawn'
+  }
+}
 
 // ---------------- 角色与审批链 ----------------
 const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理' }
@@ -428,7 +449,8 @@ app.get('/api/state', (req, res) => {
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
-    defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP }
+    defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
+    ...getCrisisState()
   })
 })
 
@@ -796,6 +818,7 @@ app.post('/api/applications/:id/advance', (req, res, next) => {
 app.post('/api/applications/:id/reject', (req, res, next) => {
   const id = num(req.params.id)
   const b = req.body || {}
+  const actor = currentUser(req)
   try {
     const out = tx(() => {
       const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
@@ -811,6 +834,12 @@ app.post('/api/applications/:id/reject', (req, res, next) => {
         operator: b.operator, fromStage
       })
       db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, id)
+      auditPassive({
+        category: 'action', action: 'state.reject', actor, applicationId: id,
+        refType: 'application', refId: id,
+        summary: `危机相关流程淘汰：${STAGE_LABEL[fromStage] || fromStage} → 淘汰`,
+        detail: { from: fromStage, to: 'rejected', reason: b.reason || '' }
+      })
       return { ok: true, stage: 'rejected', from: fromStage, version: a.version, snapshot: r.snapshot }
     })
     if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
@@ -822,12 +851,26 @@ app.post('/api/applications/:id/reject', (req, res, next) => {
 app.post('/api/applications/:id/rollback', (req, res, next) => {
   const id = num(req.params.id)
   const b = req.body || {}
+  const actor = currentUser(req)
   try {
     const out = tx(() => {
       const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
       if (!a) return { notFound: true }
+      const fromStage = a.stage
+      const offerBefore = offerOfApp(a.id)
       const r = rollbackStage(a, { operator: b.operator, expectedVersion: b.version, reason: b.reason || '' })
       if (a.stage === 'rejected') db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(id)
+      const offerAfter = offerOfApp(a.id)
+      // 若该应聘关联了进行中的危机事件，状态回退同事务追加到不可篡改审计链
+      auditPassive({
+        category: 'rollback', action: 'state.rollback', actor, applicationId: id,
+        refType: 'application', refId: id,
+        summary: `流程异常回退：${STAGE_LABEL[fromStage] || fromStage} → ${STAGE_LABEL[a.stage] || a.stage}`,
+        detail: {
+          from: fromStage, to: a.stage, reason: b.reason || '',
+          offer_withdrawn: !!offerBefore && offerBefore.status !== 'withdrawn' && offerAfter?.status === 'withdrawn'
+        }
+      })
       return { ok: true, stage: a.stage, version: a.version, snapshot: r.snapshot }
     })
     if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
@@ -1229,6 +1272,13 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
         db.prepare("UPDATE approval_tasks SET status='failed', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
           .run(stamp, note, execErr.message, taskId)
         addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'failed', actor: user, note: `审批通过但执行失败：${execErr.message}` })
+        // 危机事件关联的应聘：审批回写失败也是关键处置事件，上链留痕
+        auditPassive({
+          category: 'decision', action: 'approval.failed', actor: user, applicationId: t.application_id,
+          refType: 'approval', refId: taskId,
+          summary: `${meta.label}审批通过但执行回写失败：${execErr.message}`,
+          detail: { task_id: taskId, type: t.type, error_code: execErr.code, error: execErr.message }
+        })
         notify({
           recipientRole: t.submitted_role, type: 'task_failed',
           title: `${meta.label}审批执行失败`,
@@ -1240,6 +1290,12 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       db.prepare("UPDATE approval_tasks SET status='approved', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
         .run(stamp, note, execDesc, taskId)
       addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'execute', actor: user, note: execDesc })
+      auditPassive({
+        category: 'decision', action: 'approval.execute', actor: user, applicationId: t.application_id,
+        refType: 'approval', refId: taskId,
+        summary: `${meta.label}终审通过并执行回写：${execDesc}`,
+        detail: { task_id: taskId, type: t.type, payload: parseJSON(t.payload, {}), result: execDesc }
+      })
       notify({
         recipientRole: t.submitted_role, type: 'task_executed',
         title: `${meta.label}审批通过已生效`,
@@ -1438,10 +1494,16 @@ function migrateHistory() {
 }
 migrateHistory()
 
+// 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
+bindCrisisCore({ rollbackForIncident })
+app.use('/api/crisis', crisisRouter)
+
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   if (err instanceof ApiError) return res.status(err.status).json({ ok: false, code: err.code, msg: err.message })
+  // 危机模块（独立 express.Router）抛出的带状态业务错误
+  if (err?.status && err?.code) return res.status(err.status).json({ ok: false, code: err.code, msg: err.message })
   console.error('[HR] unhandled error:', err)
   res.status(500).json({ ok: false, code: 'internal', msg: '服务内部错误' })
 })

@@ -229,18 +229,143 @@ CREATE TABLE IF NOT EXISTS approval_steps (
 CREATE INDEX IF NOT EXISTS idx_approval_steps_task ON approval_steps(task_id, id);
 
 -- 审计通知：任务提交/通过/退回/重提/生效/失败按角色投递，接收人角色可标记已读
+-- incident_id/ticket_id/owner_* 为危机处置审计模块的责任回写字段（见文件末尾兼容迁移）
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   recipient_role TEXT NOT NULL DEFAULT '',
-  type TEXT NOT NULL DEFAULT '',        -- task_submitted/task_approved/task_returned/task_resubmitted/task_executed/task_failed/task_cancelled
+  type TEXT NOT NULL DEFAULT '',        -- task_submitted/.../crisis_declared/crisis_grant/crisis_rollback/crisis_ticket/crisis_report/...
   title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL DEFAULT '',
   task_id INTEGER NOT NULL DEFAULT 0,
   application_id INTEGER NOT NULL DEFAULT 0,
   is_read INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT ''
+  created_at TEXT NOT NULL DEFAULT '',
+  incident_id INTEGER NOT NULL DEFAULT 0,
+  ticket_id INTEGER NOT NULL DEFAULT 0,
+  owner_name TEXT NOT NULL DEFAULT '',
+  owner_user_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, is_read, id);
+CREATE INDEX IF NOT EXISTS idx_notifications_incident ON notifications(incident_id, id);
+
+-- ---------------- 跨角色危机处置审计模块 ----------------
+-- 危机事件：立案后由指挥官（commander）承担跨角色处置责任，可关联一条在途应聘
+CREATE TABLE IF NOT EXISTS crisis_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',            -- CR-YYYYMMDD-NNN 人类可读事件号
+  title TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'major',   -- critical(P0)/major(P1)/minor(P2)
+  status TEXT NOT NULL DEFAULT 'declared',  -- declared/responding/contained/reviewing/closed
+  application_id INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  declared_by TEXT NOT NULL DEFAULT '',
+  declared_by_name TEXT NOT NULL DEFAULT '',
+  declared_role TEXT NOT NULL DEFAULT '',
+  declared_at TEXT NOT NULL DEFAULT '',
+  commander_id TEXT NOT NULL DEFAULT '',
+  commander_name TEXT NOT NULL DEFAULT '',
+  commander_role TEXT NOT NULL DEFAULT '',
+  contained_at TEXT NOT NULL DEFAULT '',
+  closed_at TEXT NOT NULL DEFAULT '',
+  report_hash TEXT NOT NULL DEFAULT '',     -- 复盘定稿时固化的链顶哈希
+  report_finalized_at TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1
+);
+
+-- 危机审计条目（哈希链）：只追加；每条哈希=SHA256(prev_hash + 本条规范化内容)
+-- 配合文件末尾的 BEFORE UPDATE/DELETE 触发器，数据库层面拒绝任何改写/删除
+CREATE TABLE IF NOT EXISTS crisis_audit_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,                     -- 事件内序号，从 0（立案根条目）递增
+  category TEXT NOT NULL,                   -- declare/action/authorization/rollback/decision/ticket/report/close
+  action TEXT NOT NULL,                     -- incident.declare/state.rollback/authz.grant/approval.execute/...
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  actor_role TEXT NOT NULL DEFAULT '',
+  target_role TEXT NOT NULL DEFAULT '',     -- 授权变更时被授予/收回的角色
+  ref_type TEXT NOT NULL DEFAULT '',        -- application/approval/offer/grant/ticket/report
+  ref_id TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',        -- 变更前后快照、原因、责任矩阵等
+  acted_at TEXT NOT NULL DEFAULT '',
+  prev_hash TEXT NOT NULL DEFAULT '',
+  entry_hash TEXT NOT NULL DEFAULT '',
+  UNIQUE(incident_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_crisis_entries_inc ON crisis_audit_entries(incident_id, seq);
+
+-- 危机期间的临时跨角色授权（授权变更留痕：授予/收回各上一条链）
+CREATE TABLE IF NOT EXISTS crisis_grants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  grantee_id TEXT NOT NULL,
+  grantee_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,                       -- 临时获得的角色 recruiter/interviewer/hiring_manager
+  reason TEXT NOT NULL DEFAULT '',
+  scope TEXT NOT NULL DEFAULT 'incident',   -- incident=仅限本事件处置操作
+  status TEXT NOT NULL DEFAULT 'active',    -- active/revoked
+  granted_by TEXT NOT NULL DEFAULT '',
+  granted_by_name TEXT NOT NULL DEFAULT '',
+  granted_at TEXT NOT NULL DEFAULT '',
+  revoked_by TEXT NOT NULL DEFAULT '',
+  revoked_by_name TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT NOT NULL DEFAULT '',
+  entry_id INTEGER NOT NULL DEFAULT 0,
+  revoke_entry_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_crisis_grants_inc ON crisis_grants(incident_id, status);
+
+-- 危机处置工单：责任到人（owner），改派/解决均上链并把责任人回写通知
+CREATE TABLE IF NOT EXISTS crisis_tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  priority TEXT NOT NULL DEFAULT 'P2',      -- P0/P1/P2/P3
+  status TEXT NOT NULL DEFAULT 'open',      -- open/processing/resolved/closed
+  owner_id TEXT NOT NULL DEFAULT '',
+  owner_name TEXT NOT NULL DEFAULT '',
+  owner_role TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  resolution TEXT NOT NULL DEFAULT '',
+  resolved_at TEXT NOT NULL DEFAULT '',
+  application_id INTEGER NOT NULL DEFAULT 0,
+  entry_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_crisis_tickets_inc ON crisis_tickets(incident_id, id);
+
+-- 危机复盘报告：定稿时从审计链汇总责任矩阵并固化链顶哈希，结案前必须定稿
+CREATE TABLE IF NOT EXISTS crisis_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL UNIQUE,
+  summary TEXT NOT NULL DEFAULT '',
+  root_cause TEXT NOT NULL DEFAULT '',
+  improvements TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'draft',     -- draft/finalized
+  owner_id TEXT NOT NULL DEFAULT '',
+  owner_name TEXT NOT NULL DEFAULT '',
+  entries_count INTEGER NOT NULL DEFAULT 0,
+  report_hash TEXT NOT NULL DEFAULT '',     -- 定稿瞬间（定稿条目上链前）的链顶哈希
+  responsibilities TEXT NOT NULL DEFAULT '{}', -- 从审计链/授权/工单汇总的责任信息
+  finalized_at TEXT NOT NULL DEFAULT '',
+  finalized_by TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+
+-- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
+CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
+BEFORE UPDATE ON crisis_audit_entries
+BEGIN
+  SELECT RAISE(ABORT, 'crisis_audit_entries 为只追加审计链，禁止 UPDATE');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_delete
+BEFORE DELETE ON crisis_audit_entries
+BEGIN
+  SELECT RAISE(ABORT, 'crisis_audit_entries 为只追加审计链，禁止 DELETE');
+END;
 `)
 
 // ---------------- 兼容已有库：补列迁移 ----------------
@@ -264,6 +389,12 @@ addColumn('interviews', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
+
+// 危机处置审计模块：通知表补齐「责任回写」列（旧库升级）
+addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('notifications', 'owner_name', `TEXT NOT NULL DEFAULT ''`)
+addColumn('notifications', 'owner_user_id', `TEXT NOT NULL DEFAULT ''`)
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)
