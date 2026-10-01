@@ -232,15 +232,71 @@ CREATE INDEX IF NOT EXISTS idx_approval_steps_task ON approval_steps(task_id, id
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   recipient_role TEXT NOT NULL DEFAULT '',
-  type TEXT NOT NULL DEFAULT '',        -- task_submitted/task_approved/task_returned/task_resubmitted/task_executed/task_failed/task_cancelled
+  type TEXT NOT NULL DEFAULT '',        -- task_submitted/task_approved/task_returned/task_resubmitted/task_executed/task_failed/task_cancelled/crisis_*
   title TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL DEFAULT '',
   task_id INTEGER NOT NULL DEFAULT 0,
   application_id INTEGER NOT NULL DEFAULT 0,
+  crisis_incident_id INTEGER NOT NULL DEFAULT 0, -- 关联危机事件（责任信息回写：通知可溯源到事件）
+  crisis_code TEXT NOT NULL DEFAULT '',          -- 冗余事件编号，便于通知侧直接展示
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, is_read, id);
+
+-- ---------------- 跨角色危机处置审计 ----------------
+-- 危机事件：一次跨角色危机处置（关键操作/授权变更/状态回退均挂到事件上形成独立审计链）
+CREATE TABLE IF NOT EXISTS crisis_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,            -- CRS-YYYYMMDD-NNN 人类可读事件号
+  title TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'P2',  -- P1 重大 / P2 高 / P3 中
+  status TEXT NOT NULL DEFAULT 'open',  -- open/investigating/contained/closed（终态可整体回退到 contained）
+  application_id INTEGER NOT NULL DEFAULT 0, -- 关联应聘（可选，决定自动归集哪些业务动作）
+  opened_by TEXT NOT NULL DEFAULT '',
+  opened_by_name TEXT NOT NULL DEFAULT '',
+  opened_role TEXT NOT NULL DEFAULT '',
+  opened_at TEXT NOT NULL DEFAULT '',
+  owner_id TEXT NOT NULL DEFAULT '',    -- 当前处置责任人（授权对象）
+  owner_name TEXT NOT NULL DEFAULT '',
+  owner_role TEXT NOT NULL DEFAULT '',
+  ticket_no TEXT NOT NULL DEFAULT '',   -- 关联工单号（责任信息回写）
+  ticket_status TEXT NOT NULL DEFAULT '', -- open/processing/resolved
+  postmortem TEXT NOT NULL DEFAULT '',  -- 复盘报告（结案时生成，记录各环节责任归属）
+  closed_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_crisis_incidents_status ON crisis_incidents(status, id);
+CREATE INDEX IF NOT EXISTS idx_crisis_incidents_app ON crisis_incidents(application_id);
+
+-- 审计链条目：每条记录携带 SHA-256（前条哈希 + 规范化载荷），只追加，任何篡改都导致链校验断裂
+CREATE TABLE IF NOT EXISTS crisis_audit_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,                 -- 事件内从 1 递增
+  category TEXT NOT NULL DEFAULT 'key_op', -- key_op 关键操作 / authz_change 授权变更 / rollback 状态回退
+  action TEXT NOT NULL DEFAULT '',      -- incident_open/note/owner_change/contain/close/incident_rollback/stage_advance/stage_reject/stage_rollback/offer_*/approval_*
+  title TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',    -- 规范化 JSON 载荷（动作细节、前后状态、责任信息）
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  actor_role TEXT NOT NULL DEFAULT '',
+  ref_type TEXT NOT NULL DEFAULT '',    -- application_event/approval_step/offer_log/manual 证据来源
+  ref_id INTEGER NOT NULL DEFAULT 0,
+  occurred_at TEXT NOT NULL DEFAULT '',
+  entry_hash TEXT NOT NULL DEFAULT '',  -- SHA-256(prev_hash + canonical(detail 之外的定长头字段) + canonical(detail))
+  prev_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crisis_chain ON crisis_audit_entries(incident_id, seq);
+CREATE INDEX IF NOT EXISTS idx_crisis_entries_app ON crisis_audit_entries(ref_type, ref_id);
+
+-- 只追加保护：审计链条目禁止 UPDATE/DELETE，从数据库层保证不可篡改
+CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
+BEFORE UPDATE ON crisis_audit_entries
+BEGIN SELECT RAISE(ABORT, 'crisis audit entries are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_delete
+BEFORE DELETE ON crisis_audit_entries
+BEGIN SELECT RAISE(ABORT, 'crisis audit entries are append-only'); END;
 `)
 
 // ---------------- 兼容已有库：补列迁移 ----------------
@@ -264,6 +320,8 @@ addColumn('interviews', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
+addColumn('notifications', 'crisis_incident_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('notifications', 'crisis_code', `TEXT NOT NULL DEFAULT ''`)
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)

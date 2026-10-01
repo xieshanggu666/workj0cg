@@ -42,6 +42,8 @@ export const useHrStore = defineStore('hr', {
     users: s => s.data?.users || [],
     approvals: s => s.data?.approvals || [],
     notifications: s => s.data?.notifications || [],
+    crisisIncidents: s => s.data?.crisisIncidents || [],
+    crisisEntries: s => s.data?.crisisEntries || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -60,6 +62,10 @@ export const useHrStore = defineStore('hr', {
       return this.approvals.filter(t =>
         t.status === 'pending' && t.chain[t.current_step]?.role === this.myRole
       ).length
+    },
+    // 我负责处置、且未结案的危机事件数（审计中心红点）
+    crisisMineCount() {
+      return this.crisisIncidents.filter(i => i.status !== 'closed' && i.owner_id === this.userId).length
     }
   },
   actions: {
@@ -190,6 +196,39 @@ export const useHrStore = defineStore('hr', {
     },
     markNotificationsRead(ids) {
       return this.api('POST', '/notifications/read', ids?.length ? { ids } : {})
+    },
+    // ---------------- 危机处置审计 ----------------
+    createIncident(payload) {
+      return this.runBusy(`crisis-new:${payload.application_id || 0}`, () =>
+        this.api('POST', '/crisis/incidents', payload, { success: '危机事件已开立，审计链开始记录' }))
+    },
+    changeIncidentOwner(id, payload) {
+      return this.runBusy(`crisis-owner:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/owner`, payload, { success: '处置责任人已变更（授权变更已入链）' }))
+    },
+    incidentAction(id, action, note) {
+      const msg = { investigate: '已开始处置', contain: '事件已控制', close: '已结案并生成复盘报告', note: '处置记录已追加' }[action]
+      return this.runBusy(`crisis-act:${id}:${action}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/action`, { action, note }, msg ? { success: msg } : {}))
+    },
+    rollbackIncident(id, reason) {
+      return this.runBusy(`crisis-rb:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/rollback`, { reason }, { success: '结案已回退，回退记录入审计链' }))
+    },
+    linkTicket(id, payload) {
+      return this.runBusy(`crisis-ticket:${id}`, () =>
+        this.api('POST', `/crisis/incidents/${id}/ticket`, payload, { success: '工单责任信息已回写' }))
+    },
+    // 审计链完整性校验（重算 SHA-256，返回断裂位置）
+    async verifyIncident(id) {
+      return this.runBusy(`crisis-verify:${id}`, async () => {
+        try {
+          const r = await j('GET', `/crisis/incidents/${id}/verify`)
+          this.notify(r.verification?.ok ? 'success' : 'error',
+            r.verification?.ok ? `审计链完整：共 ${r.verification.entries.length} 条，哈希校验通过` : `审计链在 #${r.verification.broken_at} 处断裂！`)
+          return r
+        } catch (e) { this.notify('error', e.message); return null }
+      })
     }
   }
 })

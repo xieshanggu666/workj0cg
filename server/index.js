@@ -1,9 +1,19 @@
 import express from 'express'
 import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
+import {
+  withActor, mirrorAppEvent,
+  createIncident, changeOwner, applyIncidentAction, rollbackIncident, upsertTicket,
+  verifyChain, SEVERITY_LABEL, INCIDENT_STATUS_LABEL, CATEGORY_META
+} from './crisis.js'
 
 const app = express()
 app.use(express.json())
 const PORT = 4160
+
+// 让「当前请求操作人」在同步业务函数与审计钩子里可见：危机审计链记录责任身份时无需层层透传
+app.use((req, res, next) => {
+  withActor(currentUser(req), next)
+})
 
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 const parseSkills = s => { try { return JSON.parse(s || '[]') } catch { return [] } }
@@ -77,16 +87,32 @@ function buildChain(type, payload, app) {
 }
 
 function addStep(taskId, { stepNo = -1, role = '', action, actor, note = '' }) {
-  db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
+  const r = db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
               VALUES(?,?,?,?,?,?,?,?)`)
     .run(taskId, stepNo, role, action, actor?.id || '', actor?.name || actor || '', note, ts())
+  const stepId = Number(r.lastInsertRowid)
+  // 危机审计归集：审批链上的提交/通过/退回/重提/撤销/执行均视为跨角色授权变更（幂等读取动作不入链）
+  const task = db.prepare('SELECT type, application_id FROM approval_tasks WHERE id=?').get(taskId)
+  if (task && action !== 'execute') {
+    mirrorAppEvent(task.application_id, {
+      category: 'authz_change',
+      action: `approval_${action}`,
+      title: `${TASK_TYPES[task.type]?.label || task.type}审批 · ${action}`,
+      detail: {
+        task_id: taskId, task_type: task.type, application_id: task.application_id,
+        step_no: stepNo, role, action, note
+      },
+      refType: 'approval_step', refId: stepId
+    })
+  }
+  return stepId
 }
 
-// 审计通知：按接收角色投递，审批中心与顶栏铃铛共用同一数据源
-function notify({ recipientRole, type, title, body, taskId = 0, appId = 0 }) {
-  db.prepare(`INSERT INTO notifications(recipient_role,type,title,body,task_id,application_id,is_read,created_at)
-              VALUES(?,?,?,?,?,?,0,?)`)
-    .run(recipientRole, type, title, body, taskId, appId, ts())
+// 审计通知：按接收角色投递，审批中心与顶栏铃铛共用同一数据源；crisis* 字段把责任信息回写到通知
+function notify({ recipientRole, type, title, body, taskId = 0, appId = 0, crisisIncidentId = 0, crisisCode = '' }) {
+  db.prepare(`INSERT INTO notifications(recipient_role,type,title,body,task_id,application_id,crisis_incident_id,crisis_code,is_read,created_at)
+              VALUES(?,?,?,?,?,?,?,?,0,?)`)
+    .run(recipientRole, type, title, body, taskId, appId, crisisIncidentId, crisisCode, ts())
 }
 
 // 乐观锁：阶段协同类操作必须携带读取时的 version；并发/重复点击导致版本错位时拒绝
@@ -114,12 +140,32 @@ function offerOfApp(applicationId) {
 }
 
 function addOfferLog({ offerId, applicationId, changeType, of, toStatus, toSalary, operator = 'HR-Sandy', note = '' }) {
-  db.prepare(`INSERT INTO offer_change_logs(offer_id,application_id,change_type,from_status,to_status,from_salary,to_salary,changed_at,operator,note)
+  const r = db.prepare(`INSERT INTO offer_change_logs(offer_id,application_id,change_type,from_status,to_status,from_salary,to_salary,changed_at,operator,note)
               VALUES(?,?,?,?,?,?,?,?,?,?)`)
     .run(offerId, applicationId, changeType,
       of?.status || '', toStatus ?? of?.status ?? '',
       num(of?.salary, 0), num(toSalary ?? of?.salary, 0),
       ts(), operator, note)
+  const logId = Number(r.lastInsertRowid)
+  // 危机审计归集：Offer 撤回（含回退联动撤回）属状态回退，其余变更属关键操作
+  const offerActionLabel = {
+    create: '发起 Offer', update_salary: '调整薪资', update_due: '调整期限',
+    accept: '候选人接受', reject: '候选人拒绝', join: '确认入职',
+    withdraw: '撤回 Offer', reopen: '重新发起'
+  }[changeType] || changeType
+  mirrorAppEvent(applicationId, {
+    category: changeType === 'withdraw' ? 'rollback' : 'key_op',
+    action: `offer_${changeType}`,
+    title: `${offerActionLabel}（Offer #${offerId}）`,
+    detail: {
+      offer_id: offerId, application_id: applicationId, change_type: changeType,
+      from_status: of?.status || '', to_status: toStatus ?? of?.status ?? '',
+      from_salary: num(of?.salary, 0), to_salary: num(toSalary ?? of?.salary, 0),
+      note, operator
+    },
+    refType: 'offer_log', refId: logId
+  })
+  return logId
 }
 
 // ---------------- 人岗匹配评分算法 ----------------
@@ -391,6 +437,37 @@ app.get('/api/state', (req, res) => {
   })
   const notifications = db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 300').all()
     .map(n => ({ ...n, is_read: !!n.is_read }))
+  // 危机处置审计：事件 + 哈希链条目（含分类/责任/证据来源元数据，复盘报告解析为 JSON）
+  const crisisEntries = db.prepare('SELECT * FROM crisis_audit_entries ORDER BY id ASC').all().map(e => ({
+    ...e,
+    seq: num(e.seq), ref_id: num(e.ref_id),
+    detail: parseJSON(e.detail, {}),
+    category_meta: CATEGORY_META[e.category] || { icon: '📌', label: e.category }
+  }))
+  const crisisIncidents = db.prepare('SELECT * FROM crisis_incidents ORDER BY id DESC').all().map(inc => {
+    const a = apps.find(x => x.id === inc.application_id)
+    const pos = a ? positions.find(p => p.id === a.position_id) : null
+    const cand = a ? candidates.find(c => c.id === a.candidate_id) : null
+    const entries = crisisEntries.filter(e => e.incident_id === inc.id)
+    const head = entries[entries.length - 1]
+    return {
+      ...inc,
+      application_id: num(inc.application_id),
+      severity_label: SEVERITY_LABEL[inc.severity] || inc.severity,
+      status_label: INCIDENT_STATUS_LABEL[inc.status] || inc.status,
+      candidate: cand ? cand.name : '',
+      position: pos ? pos.name : '',
+      entries,
+      postmortem: parseJSON(inc.postmortem, null),
+      chain_head: head?.entry_hash || '',
+      counts: {
+        total: entries.length,
+        key_op: entries.filter(e => e.category === 'key_op').length,
+        authz_change: entries.filter(e => e.category === 'authz_change').length,
+        rollback: entries.filter(e => e.category === 'rollback').length
+      }
+    }
+  })
   const latestItemOf = (cid, pid) => db.prepare(`SELECT ri.* FROM recalc_items ri
     WHERE ri.candidate_id=? AND ri.position_id=? ORDER BY ri.id DESC LIMIT 1`).get(cid, pid) || null
   const matchOf = (cid, pid) => matches.find(m => m.candidate_id === cid && m.position_id === pid) || null
@@ -428,6 +505,7 @@ app.get('/api/state', (req, res) => {
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
+    crisisIncidents, crisisEntries,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP }
   })
 })
@@ -669,6 +747,20 @@ function moveStage(app, stage, { eventType, fromStage, operator }) {
   })
   // 事件刚写入，stage_snapshot 与其同源：直接固化为该阶段事件的评分快照
   db.prepare('UPDATE applications SET stage_snapshot=? WHERE id=?').run(JSON.stringify(snap), app.id)
+  // 危机审计归集：阶段推进/淘汰属关键操作，rollback（异常回退、复活、录用回退）属状态回退
+  const ev = db.prepare(`SELECT id FROM application_events WHERE application_id=? AND stage=? AND backfilled=0 ORDER BY id DESC LIMIT 1`)
+    .get(app.id, stage)
+  mirrorAppEvent(app.id, {
+    category: eventType === 'rollback' ? 'rollback' : 'key_op',
+    action: eventType === 'rollback' ? 'stage_rollback' : eventType === 'reject' || eventType === 'offer_rejected' ? 'stage_reject' : 'stage_advance',
+    title: `${STAGE_LABEL[fromStage ?? app.stage] || (fromStage ?? app.stage)} → ${STAGE_LABEL[stage] || stage}（${EVENT_LABEL[eventType] || eventType}）`,
+    detail: {
+      application_id: app.id, candidate_id: app.candidate_id, position_id: app.position_id,
+      from_stage: fromStage ?? app.stage, to_stage: stage, event_type: eventType,
+      match_score: snap.score, strategy_id: snap.strategy_id, operator: operator || app.recruiter || 'HR-Sandy'
+    },
+    refType: 'application_event', refId: num(ev?.id, 0)
+  })
   app.stage = stage
   app.version = num(app.version) + 1
   return { stage, snapshot: snap }
@@ -1350,6 +1442,175 @@ app.post('/api/notifications/read', (req, res) => {
     db.prepare('UPDATE notifications SET is_read=1 WHERE recipient_role=? AND is_read=0').run(user.role)
   }
   res.json({ ok: true })
+})
+
+// ---------------- 跨角色危机处置审计 ----------------
+const CRISIS_SEVERITY = ['P1', 'P2', 'P3']
+
+function getIncidentOr404(res, id) {
+  const inc = db.prepare('SELECT * FROM crisis_incidents WHERE id=?').get(num(id))
+  if (!inc) res.status(404).json({ ok: false, code: 'not_found', msg: '危机事件不存在' })
+  return inc
+}
+// 处置权限：招聘负责人（处置指挥）或当前处置责任人；授权变更仅招聘负责人可发起
+function assertCanManage(inc, user, { ownerOnly = false } = {}) {
+  if (user.role === 'recruiter') return
+  if (!ownerOnly && inc.owner_id === user.id) return
+  forbidden(`该危机处置当前由「${inc.owner_name}（${ROLE_LABEL[inc.owner_role] || inc.owner_role}）」负责，请联系招聘负责人协调`, 'forbidden')
+}
+
+// 开立事件：仅招聘负责人/用人经理可发起；自动归集关联应聘上后续的关键操作、授权变更与状态回退
+app.post('/api/crisis/incidents', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    if (!['recruiter', 'hiring_manager'].includes(user.role)) {
+      forbidden('开立危机处置事件需由招聘负责人或用人经理发起', 'forbidden')
+    }
+    const title = String(b.title || '').trim()
+    if (!title) badRequest('请填写危机事件标题', 'title_required')
+    const severity = CRISIS_SEVERITY.includes(b.severity) ? b.severity : 'P2'
+    const appId = num(b.application_id)
+    if (appId && !db.prepare('SELECT id FROM applications WHERE id=?').get(appId)) {
+      return res.status(404).json({ ok: false, code: 'app_missing' })
+    }
+    let owner = user
+    if (b.owner_id) {
+      const u = db.prepare('SELECT * FROM users WHERE id=?').get(String(b.owner_id))
+      if (!u) badRequest('指定的责任人不存在', 'owner_missing')
+      owner = u
+    }
+    const out = tx(() => createIncident({
+      title, severity, applicationId: appId, owner, creator: user, note: String(b.note || '')
+    }))
+    res.json({ ok: true, ...out })
+  } catch (e) { next(e) }
+})
+
+// 事件详情（含完整链与复盘）
+app.get('/api/crisis/incidents/:id', (req, res) => {
+  const inc = getIncidentOr404(res, req.params.id)
+  if (!inc) return
+  const entries = db.prepare('SELECT * FROM crisis_audit_entries WHERE incident_id=? ORDER BY seq').all(inc.id)
+    .map(e => ({ ...e, detail: parseJSON(e.detail, {}) }))
+  res.json({ ok: true, incident: inc, entries })
+})
+
+// 授权变更：更换处置责任人（仅招聘负责人）
+app.post('/api/crisis/incidents/:id/owner', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    const out = tx(() => {
+      const inc = getIncidentOr404(res, req.params.id)
+      if (!inc) return { notFound: true }
+      if (inc.status === 'closed') conflict('事件已结案，请先回退结案再变更责任人', 'incident_closed')
+      if (user.role !== 'recruiter') forbidden('授权变更（移交处置责任）仅招聘负责人可操作', 'forbidden')
+      const target = db.prepare('SELECT * FROM users WHERE id=?').get(String(b.owner_id || ''))
+      if (!target) badRequest('请选择有效的责任人', 'owner_missing')
+      if (target.id === inc.owner_id) conflict('该成员已是当前处置责任人', 'owner_same')
+      changeOwner(inc, target, { actor: user, reason: String(b.reason || '') })
+      return { ok: true }
+    })
+    if (out?.notFound) return
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 处置动作：investigate / contain / close（结案自动生成复盘）/ note
+app.post('/api/crisis/incidents/:id/action', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    const out = tx(() => {
+      const inc = getIncidentOr404(res, req.params.id)
+      if (!inc) return { notFound: true }
+      assertCanManage(inc, user)
+      try {
+        applyIncidentAction(inc, String(b.action || ''), { actor: user, note: String(b.note || '') })
+      } catch (e2) {
+        if (e2.status) throw new ApiError(e2.status, 'invalid', e2.message)
+        throw e2
+      }
+      return { ok: true, status: inc.status }
+    })
+    if (out?.notFound) return
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 结案回退：closed → contained（状态回退入链，复盘保留）
+app.post('/api/crisis/incidents/:id/rollback', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    const out = tx(() => {
+      const inc = getIncidentOr404(res, req.params.id)
+      if (!inc) return { notFound: true }
+      assertCanManage(inc, user)
+      try {
+        rollbackIncident(inc, { actor: user, reason: String(b.reason || '') })
+      } catch (e2) {
+        if (e2.status) throw new ApiError(e2.status, 'conflict', e2.message)
+        throw e2
+      }
+      return { ok: true, status: 'contained' }
+    })
+    if (out?.notFound) return
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 工单回写：关联工单 / 标记工单解决（工单责任信息同步到审计链与通知）
+app.post('/api/crisis/incidents/:id/ticket', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    const out = tx(() => {
+      const inc = getIncidentOr404(res, req.params.id)
+      if (!inc) return { notFound: true }
+      assertCanManage(inc, user)
+      try {
+        upsertTicket(inc, {
+          ticketNo: String(b.ticket_no || '').trim(),
+          action: b.action === 'resolve' ? 'resolve' : 'create',
+          note: String(b.note || ''), actor: user
+        })
+      } catch (e2) {
+        if (e2.status) throw new ApiError(e2.status, 'invalid', e2.message)
+        throw e2
+      }
+      return { ok: true }
+    })
+    if (out?.notFound) return
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 审计链完整性校验：逐条重算 SHA-256 并校验前向指针，返回断裂位置
+app.get('/api/crisis/incidents/:id/verify', (req, res) => {
+  const inc = getIncidentOr404(res, req.params.id)
+  if (!inc) return
+  res.json({ ok: true, code: inc.code, verification: verifyChain(inc.id) })
+})
+
+// 全局审计台账：跨事件按时间倒序检索条目（支持事件/分类/动作/责任人过滤）
+app.get('/api/crisis/ledger', (req, res) => {
+  const { incident, category, q } = req.query
+  const where = [], vals = []
+  if (incident) { where.push('e.incident_id=?'); vals.push(num(incident)) }
+  if (category) { where.push('e.category=?'); vals.push(String(category)) }
+  const sql = `SELECT e.*, i.code code, i.title incident_title FROM crisis_audit_entries e
+               JOIN crisis_incidents i ON i.id=e.incident_id
+               ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.id DESC LIMIT 500`
+  let rows = db.prepare(sql).all(...vals).map(e => ({ ...e, detail: parseJSON(e.detail, {}) }))
+  if (q) {
+    const kw = String(q).toLowerCase()
+    rows = rows.filter(e =>
+      [e.title, e.actor_name, e.action, e.code, e.incident_title, e.detail].map(x => JSON.stringify(x ?? '').toLowerCase())
+        .some(v => v.includes(kw)))
+  }
+  res.json({ ok: true, entries: rows, category_meta: CATEGORY_META })
 })
 
 // ---------------- 渠道 ----------------
